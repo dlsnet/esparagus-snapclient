@@ -203,7 +203,21 @@ static int32_t dsp_processor_gen_filter(ptype_t *filter, uint32_t cnt) {
 /**
  *
  */
-int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate) {
+int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate,
+                         i2s_data_bit_width_t bits) {
+  static bool warned_passthrough = false;
+
+  if (bits != I2S_DATA_BIT_WIDTH_16BIT) {
+    if (!warned_passthrough) {
+      ESP_LOGW(TAG, "Bypassing DSP for %d-bit PCM to preserve bit depth", bits);
+      warned_passthrough = true;
+    }
+
+    return 0;
+  }
+
+  warned_passthrough = false;
+
   int16_t len = chunk_size / 4;
   int16_t valint;
   uint16_t i;

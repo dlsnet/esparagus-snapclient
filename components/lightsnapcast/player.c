@@ -13,6 +13,7 @@
 // #include "lwip/stats.h"
 
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "soc/rtc.h"
@@ -27,15 +28,271 @@
 #include "board_pins_config.h"
 #include "driver/gptimer.h"
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
+#include <inttypes.h>
+
+#include "esp_heap_caps.h"
+#include "led_manager.h"
+
+
+// Move TAG definition to the top before audio power control functions
+static const char *TAG = "PLAYER";
+
+// --- Audio power control (AMP and DAC enable pins) ---
+#ifndef AMP_EN_GPIO
+#define AMP_EN_GPIO 16  // Board-specific: amplifier enable pin
+#endif
+#ifndef DAC_EN_GPIO
+#define DAC_EN_GPIO 17  // Board-specific: DAC analog side enable pin
+#endif
+#ifndef PLAYBACK_EN_GPIO
+#define PLAYBACK_EN_GPIO 5  // Board-specific: LED on when playing
+#endif
+#ifndef IDLE_GPIO
+#define IDLE_GPIO 2  // Board-specific: LED on when idle
+#endif
+
+#ifndef POWER_OFF_DELAY_MS
+#define POWER_OFF_DELAY_MS (10 * 60 * 1000)  // 10 minutes default
+#endif
+
+static bool s_audio_pwr_init_done = false;
+static bool s_power_off_pending = false;
+static TickType_t s_power_off_timer = 0;
+static SemaphoreHandle_t s_power_mutex = NULL;
+static uint32_t s_power_off_delay_ms = POWER_OFF_DELAY_MS;
+
+// Software volume control
+static int32_t software_volume_scale = 256; // 256 = 1.0, 512 = 2.0, etc.
+
+static inline void audio_power_init(void)
+{
+    if (s_audio_pwr_init_done) return;
+
+    // Create mutex for power state protection
+    if (s_power_mutex == NULL) {
+        s_power_mutex = xSemaphoreCreateMutex();
+        if (s_power_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create power mutex");
+            return;
+        }
+    }
+
+    // Configure AMP/DAC GPIO pins (LED pins are managed by led_manager to avoid cross-module conflicts)
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = (1ULL << AMP_EN_GPIO) | (1ULL << DAC_EN_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&io_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Initialize LED manager (idempotent). This centralizes LED ownership and prevents conflicts with main.c.
+    led_manager_init(IDLE_GPIO, PLAYBACK_EN_GPIO, true);
+
+    // Initialize all pins to safe state
+    gpio_set_level(AMP_EN_GPIO, 0);      // AMP off
+    gpio_set_level(DAC_EN_GPIO, 0);      // DAC off
+    // LEDs are driven by led_manager to avoid conflicts with main.c
+    led_manager_set_audio_state(LED_AUDIO_IDLE);
+
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+    s_power_off_pending = false;
+    s_power_off_timer = 0;
+    xSemaphoreGive(s_power_mutex);
+
+    ESP_LOGI(TAG, "Audio power control initialized: AMP=%d, DAC=%d, PLAY_LED=%d, IDLE_LED=%d, Delay=%lums",
+             AMP_EN_GPIO, DAC_EN_GPIO, PLAYBACK_EN_GPIO, IDLE_GPIO, s_power_off_delay_ms);
+
+    s_audio_pwr_init_done = true;
+}
+
+// Monitor and log memory health
+void monitor_system_health(void)
+{
+    static int64_t last_check_ms = 0;
+    const int64_t now_ms = esp_timer_get_time() / 1000; // Convert to milliseconds
+
+    if ((now_ms - last_check_ms) >= 30000) { // Every 30 seconds
+        ESP_LOGI("HEALTH", "Free memory: %" PRIu32 ", Largest block: %" PRIu32,
+                 (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        last_check_ms = now_ms;
+    }
+}
+
+static inline void audio_power_up(void)
+{
+    audio_power_init();
+    if (!s_audio_pwr_init_done || s_power_mutex == NULL) {
+        ESP_LOGW(TAG, "Audio power not initialized; ignoring power_up request");
+        return;
+    }
+
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+
+    // Cancel any pending power-off
+    s_power_off_pending = false;
+    s_power_off_timer = 0;
+
+    xSemaphoreGive(s_power_mutex);
+
+    ESP_LOGI(TAG, "Powering up audio system");
+
+    // Power up sequence - add small delays to avoid pops
+    gpio_set_level(DAC_EN_GPIO, 1);      // Enable DAC first
+    vTaskDelay(pdMS_TO_TICKS(10));       // Short delay
+    gpio_set_level(AMP_EN_GPIO, 1);      // Then enable amplifier
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Update LED states (centralized)
+    led_manager_set_audio_state(LED_AUDIO_PLAYING);
+}
+
+static inline void audio_power_down_immediate(void)
+{
+    if (!s_audio_pwr_init_done) return;
+
+    ESP_LOGI(TAG, "Immediate power down of audio system");
+
+    // Power down sequence
+    gpio_set_level(AMP_EN_GPIO, 0);      // Disable amplifier first
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(DAC_EN_GPIO, 0);      // Then disable DAC
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Update LED states (centralized)
+    led_manager_set_audio_state(LED_AUDIO_IDLE);
+
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+    s_power_off_pending = false;
+    s_power_off_timer = 0;
+    xSemaphoreGive(s_power_mutex);
+}
+
+static inline void audio_power_down_delayed(void)
+{
+    if (!s_audio_pwr_init_done) return;
+
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+
+    if (!s_power_off_pending) {
+        s_power_off_pending = true;
+        s_power_off_timer = xTaskGetTickCount();
+        ESP_LOGI(TAG, "Scheduled power down in %lums", s_power_off_delay_ms);
+    }
+
+    xSemaphoreGive(s_power_mutex);
+}
+
+static inline void audio_power_check_timeout(void)
+{
+    if (!s_audio_pwr_init_done || !s_power_off_pending) return;
+
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+
+    if (s_power_off_pending) {
+        TickType_t current_time = xTaskGetTickCount();
+        TickType_t elapsed = current_time - s_power_off_timer;
+
+        if (elapsed >= pdMS_TO_TICKS(s_power_off_delay_ms)) {
+            // Timeout reached, power down now
+            xSemaphoreGive(s_power_mutex); // Release before calling power down
+            audio_power_down_immediate();
+            return;
+        }
+    }
+
+    xSemaphoreGive(s_power_mutex);
+}
+
+// Public function to set power-off delay
+void audio_set_power_off_delay(uint32_t delay_ms)
+{
+    xSemaphoreTake(s_power_mutex, portMAX_DELAY);
+    s_power_off_delay_ms = delay_ms;
+    xSemaphoreGive(s_power_mutex);
+
+    ESP_LOGI(TAG, "Power-off delay set to %lums", delay_ms);
+}
+
+// Software volume control functions
+static inline void set_software_volume(float volume_multiplier) {
+    software_volume_scale = (int32_t)(256 * volume_multiplier);
+    ESP_LOGI(TAG, "Software volume set to: %.2f (scale: %ld)", volume_multiplier, software_volume_scale);
+}
+
+static inline void apply_software_volume(int16_t *audio_data, size_t samples_count) {
+    if (software_volume_scale == 256) {
+        return;
+    }
+
+    for (size_t i = 0; i < samples_count; i++) {
+        int32_t scaled_sample = (int32_t)audio_data[i] * software_volume_scale / 256;
+
+        // Clamp to 16-bit range to prevent distortion
+        if (scaled_sample > 32767) scaled_sample = 32767;
+        if (scaled_sample < -32768) scaled_sample = -32768;
+
+        audio_data[i] = (int16_t)scaled_sample;
+    }
+}
+
+static inline size_t player_pcm_bytes_per_sample(i2s_data_bit_width_t bits) {
+    return ((size_t)bits + 7U) / 8U;
+}
+
+static inline size_t player_pcm_bytes_per_frame(uint8_t channels,
+                                                i2s_data_bit_width_t bits) {
+    return (size_t)channels * player_pcm_bytes_per_sample(bits);
+}
+
+static inline i2s_mclk_multiple_t player_get_mclk_multiple(i2s_data_bit_width_t bits) {
+    return (bits == I2S_DATA_BIT_WIDTH_24BIT) ? I2S_MCLK_MULTIPLE_384
+                                              : I2S_MCLK_MULTIPLE_256;
+}
+
+// Debug function for audio data
+static void debug_audio_data(const char* tag, int16_t *data, size_t count) {
+    int16_t min = 32767, max = -32768;
+    for (size_t i = 0; i < count && i < 100; i++) { // Check first 100 samples
+        if (data[i] < min) min = data[i];
+        if (data[i] > max) max = data[i];
+    }
+    ESP_LOGI(tag, "Audio range: min=%d, max=%d, peak-to-peak=%d", min, max, max-min);
+}
+
+// --- /Audio power control ---
 #include "player.h"
 #include "snapcast.h"
 
+#include "soc/soc_caps.h"
+#if SOC_APLL_SUPPORTED
+#include "esp_private/rtc_clk.h"
+#endif
+
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
+
+#if USE_SAMPLE_INSERTION
+// Declarations for sample insertion (implementation provided elsewhere)
+void sample_insertion_reset(void);
+void sample_insertion_feed(int32_t age_us);
+bool sample_insertion_should_insert(int16_t *n);
+#else
+static inline void sample_insertion_reset(void) {}
+static inline void sample_insertion_feed(int32_t age_us) { (void)age_us; }
+static inline bool sample_insertion_should_insert(int16_t *n) { (void)n; return false; }
+#endif
 
 #define SYNC_TASK_PRIORITY (configMAX_PRIORITIES - 1)
 #define SYNC_TASK_CORE_ID 1  // tskNO_AFFINITY
 
-static const char *TAG = "PLAYER";
+// TAG is now defined at the top
 
 #if USE_SAMPLE_INSERTION
 
@@ -142,7 +399,8 @@ esp_err_t my_i2s_channel_enable(i2s_chan_handle_t handle) {
  */
 static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
                                   snapcastSetting_t *setting) {
-#if USE_SAMPLE_INSERTION
+// // USE_SAMPLE_INSERTION
+  i2s_mclk_multiple_t mclk_multiple = player_get_mclk_multiple(setting->bits);
 
 #if USE_BIG_DMA_BUFFER == 0
   i2sDmaBufMaxLen = 12;
@@ -171,43 +429,23 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
   i2sDmaBufMaxLen = __dmaBufLen;
 #endif
 
-#else
   int fi2s_clk;
-  const int __dmaBufMaxLen = 1024;
-  int __dmaBufCnt;
-  int __dmaBufLen;
-
-  __dmaBufCnt = 1;
-  __dmaBufLen = setting->chkInFrames;
-  while ((__dmaBufLen >= __dmaBufMaxLen) || (__dmaBufCnt <= 1)) {
-    if ((__dmaBufLen % 2) == 0) {
-      __dmaBufCnt *= 2;
-      __dmaBufLen /= 2;
-    } else {
-      ESP_LOGE(TAG,
-               "player_setup_i2s: Can't setup i2s with this configuration");
-
-      return -1;
-    }
-  }
-
-  i2sDmaBufCnt = __dmaBufCnt * CHNK_CTRL_CNT;
-  i2sDmaBufMaxLen = __dmaBufLen;
 
   // check i2s_set_get_apll_freq() how it is done
-  fi2s_clk = 2 * setting->sr *
-             I2S_MCLK_MULTIPLE_256;  // setting->ch * setting->bits * m_scale;
+  fi2s_clk = 2 * setting->sr * (int)mclk_multiple;
 
   apll_normal_predefine[0] = setting->bits;
   apll_normal_predefine[1] = setting->sr;
+
+#if SOC_APLL_SUPPORTED
   if (rtc_clk_apll_coeff_calc(
           fi2s_clk, &apll_normal_predefine[5], &apll_normal_predefine[2],
           &apll_normal_predefine[3], &apll_normal_predefine[4]) == 0) {
     ESP_LOGE(TAG, "ERROR, fi2s_clk");
   }
 
-#define UPPER_SR_SCALER 1.0001
-#define LOWER_SR_SCALER 0.9999
+  #define UPPER_SR_SCALER 1.0001
+  #define LOWER_SR_SCALER 0.9999
 
   apll_corr_predefine[0][0] = setting->bits;
   apll_corr_predefine[0][1] = setting->sr * UPPER_SR_SCALER;
@@ -217,6 +455,7 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
           &apll_corr_predefine[0][4]) == 0) {
     ESP_LOGE(TAG, "ERROR, fi2s_clk * %f", UPPER_SR_SCALER);
   }
+
   apll_corr_predefine[1][0] = setting->bits;
   apll_corr_predefine[1][1] = setting->sr * LOWER_SR_SCALER;
   if (rtc_clk_apll_coeff_calc(
@@ -225,6 +464,12 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
           &apll_corr_predefine[1][4]) == 0) {
     ESP_LOGE(TAG, "ERROR, fi2s_clk * %f", LOWER_SR_SCALER);
   }
+#else
+  // ESP32-S3 path (no APLL): skip coeff calc and rely on standard I2S clocking.
+  // If later code expects "APLL is configured", make sure it's gated with SOC_APLL_SUPPORTED too.
+  (void)fi2s_clk;
+  (void)setting;
+  ESP_LOGW(TAG, "APLL not supported on this target; using standard I2S clock.");
 #endif
 
   ESP_LOGI(TAG, "player_setup_i2s: dma_buf_len is %ld, dma_buf_count is %ld",
@@ -258,7 +503,7 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
       #else
           I2S_CLK_SRC_APLL,
       #endif
-      .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+      .mclk_multiple = mclk_multiple,
   };
   i2s_std_config_t tx_std_cfg = {
       .clk_cfg = i2s_clkcfg,
@@ -346,9 +591,7 @@ static int destroy_pcm_queue(QueueHandle_t *queueHandle) {
  * ensure this is called after http_task was killed!
  */
 int deinit_player(void) {
-  int ret = 0;
-
-  // stop the task
+  // Remove unused variable 'ret'
   if (playerTaskHandle == NULL) {
     ESP_LOGW(TAG, "no sync task created?");
   } else {
@@ -360,7 +603,7 @@ int deinit_player(void) {
     snapcastSettingsMux = NULL;
   }
 
-  ret = destroy_pcm_queue(&pcmChkQHdl);
+  destroy_pcm_queue(&pcmChkQHdl);
 
   if (playerPcmQueueMux != NULL) {
     vSemaphoreDelete(playerPcmQueueMux);
@@ -376,25 +619,33 @@ int deinit_player(void) {
 
   tg0_timer_deinit();
 
+  // Power down audio system immediately on deinit
+  audio_power_down_immediate();
+
+  // Clean up power mutex
+  if (s_power_mutex != NULL) {
+    vSemaphoreDelete(s_power_mutex);
+    s_power_mutex = NULL;
+  }
+
   ESP_LOGI(TAG, "deinit player done");
 
-  return ret;
+  return 0;
 }
 
 /**
  *  call before http task creation!
  */
 int init_player(void) {
-  int ret = 0;
-
+  // Remove unused variable 'ret'
   currentSnapcastSetting.buf_ms = 1000;
   currentSnapcastSetting.chkInFrames = 1152;
   currentSnapcastSetting.codec = NONE;
-  currentSnapcastSetting.sr = 48000;
+  currentSnapcastSetting.sr = 48000;  //was 48000
   currentSnapcastSetting.ch = 2;
-  currentSnapcastSetting.bits = 16;
+  currentSnapcastSetting.bits = 16;  //was 16
   currentSnapcastSetting.muted = true;
-  currentSnapcastSetting.volume = 70;
+  currentSnapcastSetting.volume = 50;
 
   if (snapcastSettingsMux == NULL) {
     snapcastSettingsMux = xSemaphoreCreateMutex();
@@ -425,6 +676,12 @@ int init_player(void) {
   MEDIANFILTER_Init(&miniMedianFilter);
 
   tg0_timer_init();
+
+  // Initialize audio power control (will set default states)
+  audio_power_init();
+
+  // Keep the playback path transparent by default.
+  set_software_volume(1.0f);
 
   if (playerTaskHandle == NULL) {
     ESP_LOGI(TAG, "Start player_task");
@@ -793,6 +1050,8 @@ static void tg0_timer1_start(uint64_t alarm_value) {
 // sdm0/65536)/((o_div + 2) * 2) xtal == 40MHz on lyrat v4.3 I2S bit_clock =
 // rate * (number of channels) * bits_per_sample
 void adjust_apll(int8_t direction) {
+  // Only define and use these variables for ESP32 with APLL support
+#ifdef CONFIG_IDF_TARGET_ESP32
   int sdm0, sdm1, sdm2, o_div;
 
   // only change if necessary
@@ -822,13 +1081,12 @@ void adjust_apll(int8_t direction) {
     direction = 0;
   }
 
-  #ifdef CONFIG_IDF_TARGET_ESP32
   //  periph_rtc_apll_acquire();
   rtc_clk_apll_coeff_set(o_div, sdm0, sdm1, sdm2);
   // rtc_clk_apll_enable(1, sdm0, sdm1, sdm2, o_div);
-  #endif
 
   currentDir = direction;
+#endif
 }
 
 /**
@@ -1190,7 +1448,6 @@ static void player_task(void *pvParameters) {
   pcm_chunk_message_t *chnk = NULL;
   int64_t serverNow = 0;
   int64_t age;
-  int64_t savedAge = 0;
   BaseType_t ret;
   int64_t chkDur_us = 24000;
   char *p_payload = NULL;
@@ -1202,8 +1459,10 @@ static void player_task(void *pvParameters) {
   int initialSync = 0;
   int64_t avg = 0;
   int dir = 0;
+#if USE_SAMPLE_INSERTION
   int32_t dir_insert_sample = 0;
   int32_t insertedSamplesCounter = 0;
+#endif
   int64_t buf_us = 0;
   pcm_chunk_fragment_t *fragment = NULL;
   size_t written;
@@ -1211,6 +1470,10 @@ static void player_task(void *pvParameters) {
   int64_t clientDacLatency_us = 0;
   int64_t diff2Server = 0;
   int64_t outputBufferDacTime = 0;
+
+  // Add power management variables
+  TickType_t last_power_check = xTaskGetTickCount();
+  const TickType_t power_check_interval = pdMS_TO_TICKS(1000); // Check every second
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
 
@@ -1224,8 +1487,17 @@ static void player_task(void *pvParameters) {
   initialSync = 0;
 
   audio_set_mute(true);
+  audio_power_down_immediate();  // Ensure power is off at start
 
   while (1) {
+    monitor_system_health();
+    // Check power timeout every second
+    TickType_t current_time = xTaskGetTickCount();
+    if (current_time - last_power_check >= power_check_interval) {
+      audio_power_check_timeout();
+      last_power_check = current_time;
+    }
+
     // ESP_LOGW( TAG, "32b f %d b %d", heap_caps_get_free_size
     //(MALLOC_CAP_8BIT), heap_caps_get_largest_free_block (MALLOC_CAP_8BIT));
     // ESP_LOGW (TAG, "stack free: %d", uxTaskGetStackHighWaterMark(NULL));
@@ -1256,6 +1528,7 @@ static void player_task(void *pvParameters) {
             (scSet.ch != __scSet.ch)) {
           my_i2s_channel_enable(tx_chan);
           audio_set_mute(true);
+          audio_power_down_immediate();
           my_i2s_channel_disable(tx_chan);
 
           ret = player_setup_i2s(I2S_NUM_0, &__scSet);
@@ -1351,8 +1624,7 @@ static void player_task(void *pvParameters) {
                              (int64_t)chnk->timestamp.usec;
 
         age = serverNow - chunkStart - buf_us + clientDacLatency_us;
-#if USE_BIG_DMA_BUFFER
-        savedAge = age;
+#if USE_BIG_DMA_BUFFER && USE_SAMPLE_INSERTION
         if (insertedSamplesCounter > 0) {
           age -= (((1 + insertedSamplesCounter / i2sDmaBufMaxLen) * chkDur_us /
                    2) -
@@ -1454,7 +1726,15 @@ static void player_task(void *pvParameters) {
 
           // TODO: use a timer to un-mute non blocking
           vTaskDelay(pdMS_TO_TICKS(2));
-          audio_set_mute(scSet.muted);
+
+          // Power up and unmute if not muted in settings
+          if (!scSet.muted) {
+            audio_power_up();
+            audio_set_mute(false);
+          } else {
+            audio_set_mute(true);
+            audio_power_down_delayed();
+          }
 
           ESP_LOGI(TAG, "initial sync age: %lldus, chunk duration: %lldus", age,
                    chkDur_us);
@@ -1496,9 +1776,12 @@ static void player_task(void *pvParameters) {
 
         initialSync = 0;
 
+#if USE_SAMPLE_INSERTION
         insertedSamplesCounter = 0;
+#endif
 
         audio_set_mute(true);
+        audio_power_down_delayed();
 
         my_i2s_channel_disable(tx_chan);
 
@@ -1509,7 +1792,7 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      const int64_t hardResyncThreshold = 5000;  // µs, hard sync
+      const int64_t hardResyncThreshold = 500000;  // µs, hard sync
 
       if (initialSync == 1) {
         avg = age;
@@ -1524,7 +1807,7 @@ static void player_task(void *pvParameters) {
         // resync hard if we are getting very late / early.
         // rest gets tuned in through apll speed control
         if ((msgWaiting == 0) || (MEDIANFILTER_isFull(&shortMedianFilter, 0) &&
-                                  (abs(shortMedian) > hardResyncThreshold))) {
+                                  (llabs(shortMedian) > hardResyncThreshold))) {
           if (chnk != NULL) {
             free_pcm_chunk(chnk);
             chnk = NULL;
@@ -1543,12 +1826,15 @@ static void player_task(void *pvParameters) {
           my_gptimer_stop(gptimer);
 
           audio_set_mute(true);
+          audio_power_down_delayed();
 
           my_i2s_channel_disable(tx_chan);
 
           initialSync = 0;
 
+#if USE_SAMPLE_INSERTION
           insertedSamplesCounter = 0;
+#endif
 
           continue;
         }
@@ -1586,21 +1872,19 @@ static void player_task(void *pvParameters) {
         const uint32_t tmpCntInit = 1;  // 250  // every 6s
         static uint32_t tmpcnt = 1;
         if (--tmpcnt == 0) {
-          int64_t sec, msec, usec;
+          int64_t sec, usec;
 
           tmpcnt = tmpCntInit;
 
           sec = diff2Server / 1000000;
           usec = diff2Server - sec * 1000000;
-          msec = usec / 1000;
-          usec = usec % 1000;
 
           // ESP_LOGI(TAG, "%d, %lldus, q %d", dir, avg,
           //                uxQueueMessagesWaiting(pcmChkQHdl));
 
-          // ESP_LOGI(TAG, "%d, %lldus, %lldus %llds, %lld.%lldms", dir, age,
+          // ESP_LOGI(TAG, "%d, %lldus, %lldus %llds, %lldus", dir, age,
           // avg,
-          //         sec, msec, usec);
+          //         sec, usec);
 
           // ESP_LOGI(TAG, "%d, %lldus, %lldus, %lldus, q:%d", dir, avg,
           //          shortMedian, miniMedian,
@@ -1642,6 +1926,12 @@ static void player_task(void *pvParameters) {
             dir_insert_sample = 0;
 #endif
 
+            // This helper operates on 16-bit samples only.
+            if (scSet.bits == 16) {
+              size_t sample_count = size / sizeof(int16_t);
+              apply_software_volume((int16_t *)p_payload, sample_count);
+            }
+
             if (i2s_channel_write(tx_chan, p_payload, size, &written,
                                   portMAX_DELAY) != ESP_OK) {
               ESP_LOGE(TAG, "i2s_playback_task: I2S write error %d", size);
@@ -1672,13 +1962,17 @@ static void player_task(void *pvParameters) {
           // here we have an empty fragment because of memory allocation error.
           // fill DMA with zeros so we don't get out of sync
           written = 0;
-          const size_t write_size = 4;
-          uint8_t tmpBuf[write_size];
+          size_t write_size = player_pcm_bytes_per_frame(scSet.ch, scSet.bits);
+          uint8_t tmpBuf[8] = {0};
 
-          memset(tmpBuf, 0, sizeof(tmpBuf));
+          if ((write_size == 0) || (write_size > sizeof(tmpBuf))) {
+            write_size = sizeof(tmpBuf);
+          }
 
           do {
-            if (i2s_channel_write(tx_chan, tmpBuf, write_size, &written,
+            size_t chunk_size = (size < write_size) ? size : write_size;
+
+            if (i2s_channel_write(tx_chan, tmpBuf, chunk_size, &written,
                                   portMAX_DELAY) != ESP_OK) {
               ESP_LOGE(TAG, "i2s_playback_task: I2S write error %d", size);
             }
@@ -1691,18 +1985,16 @@ static void player_task(void *pvParameters) {
         }
       }
     } else {
-      int64_t sec, msec, usec;
+      int64_t sec, usec;
 
       sec = diff2Server / 1000000;
       usec = diff2Server - sec * 1000000;
-      msec = usec / 1000;
-      usec = usec % 1000;
 
       if (pcmChkQHdl != NULL) {
         ESP_LOGE(TAG,
                  "Couldn't get PCM chunk, recv: messages waiting %d, "
-                 "diff2Server: %llds, %lld.%lldms",
-                 uxQueueMessagesWaiting(pcmChkQHdl), sec, msec, usec);
+                 "diff2Server: %llds, %lldus",
+                 uxQueueMessagesWaiting(pcmChkQHdl), sec, usec);
       }
 
       dir = 0;
@@ -1710,6 +2002,7 @@ static void player_task(void *pvParameters) {
       initialSync = 0;
 
       audio_set_mute(true);
+      audio_power_down_delayed();
 
       my_i2s_channel_disable(tx_chan);
     }

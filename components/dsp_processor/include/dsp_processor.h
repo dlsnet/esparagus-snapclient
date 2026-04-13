@@ -1,6 +1,7 @@
 #ifndef _DSP_PROCESSOR_H_
 #define _DSP_PROCESSOR_H_
 
+#include "hal/i2s_types.h"
 #include "esp_err.h"
 
 typedef enum dspFlows {
@@ -60,7 +61,8 @@ typedef struct pnode {
 
 void dsp_processor_init(void);
 void dsp_processor_uninit(void);
-int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate);
+int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate,
+                         i2s_data_bit_width_t bits);
 esp_err_t dsp_processor_update_filter_params(filterParams_t *params);
 void dsp_processor_set_volome(double volume);
 

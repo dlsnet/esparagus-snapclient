@@ -6,18 +6,18 @@ menu "Snapclient Configuration"
             Use mDNS to look for the snapserver to connect to on the local network.
 
     config SNAPSERVER_HOST
-        string "Snapserver host"
+        string "Snapserver host/fallback host"
         default "192.168.1.158"
-        depends on !SNAPSERVER_USE_MDNS
         help
-            Host (ip or name) of snapserver to connect to if mDNS is disabled or the mDNS resolution fails.
+            Host (IP or name) of snapserver to connect to when mDNS is disabled,
+            or as a fallback if mDNS service discovery fails.
 
     config SNAPSERVER_PORT
-        int "Snapserver port"
+        int "Snapserver port/fallback port"
         default 1704
-        depends on !SNAPSERVER_USE_MDNS
         help
-            Port of the snapserver to connect to.
+            Port of the snapserver to connect to when mDNS is disabled,
+            or as a fallback if mDNS service discovery fails.
 
     config SNAPCLIENT_NAME
         string "snapclient name"

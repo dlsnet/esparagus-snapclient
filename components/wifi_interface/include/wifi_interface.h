@@ -1,6 +1,10 @@
 #ifndef _WIFI_INTERFACE_H_
 #define _WIFI_INTERFACE_H_
 
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "esp_err.h"
 #include "esp_netif_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -9,8 +13,8 @@
 // use wifi provisioning
 #define ENABLE_WIFI_PROVISIONING CONFIG_ENABLE_WIFI_PROVISIONING
 
-/* Hardcoded WiFi configuration that you can set via
-   'make menuconfig'.
+/* WiFi configuration supplied through sdkconfig overlays or
+   'idf.py menuconfig'.
 */
 #if !ENABLE_WIFI_PROVISIONING
 #define WIFI_SSID CONFIG_WIFI_SSID
@@ -27,6 +31,10 @@
 #define WIFI_FAIL_BIT BIT1
 
 void wifi_init(void);
+bool wifi_is_connected(void);
+uint32_t wifi_get_disconnect_count(void);
+esp_err_t wifi_wait_for_connection(TickType_t timeout_ticks);
+esp_err_t wifi_reconnect(void);
 esp_netif_t *get_current_netif(void);
 
 #endif /* _WIFI_INTERFACE_H_ */

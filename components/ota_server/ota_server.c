@@ -137,7 +137,7 @@ static esp_err_t create_tcp_server() {
   }
 
   struct sockaddr_in client_addr;
-  unsigned int socklen = sizeof(client_addr);
+  socklen_t socklen = sizeof(client_addr);
   connect_socket =
       accept(server_socket, (struct sockaddr *)&client_addr, &socklen);
 

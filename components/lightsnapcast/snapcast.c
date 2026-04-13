@@ -51,7 +51,9 @@ int base_message_deserialize(base_message_t *msg, const char *data,
   result |= buffer_read_int32(&buffer, &(msg->sent.usec));
   result |= buffer_read_int32(&buffer, &(msg->received.sec));
   result |= buffer_read_int32(&buffer, &(msg->received.usec));
-  result |= buffer_read_uint32(&buffer, &(msg->size));
+  uint32_t payload_size_u32 = 0;
+  result |= buffer_read_uint32(&buffer, &payload_size_u32);
+  msg->size = (size_t)payload_size_u32;
 
   return result;
 }
@@ -217,6 +219,10 @@ int codec_header_message_deserialize(codec_header_message_t *msg,
   uint32_t string_size;
   int result = 0;
 
+  if (!msg || !data) {
+    return 1;
+  }
+
   buffer_read_init(&buffer, data, size);
 
   result |= buffer_read_uint32(&buffer, &string_size);
@@ -235,15 +241,22 @@ int codec_header_message_deserialize(codec_header_message_t *msg,
   // Make sure the codec is a proper C string by terminating it with a null
   // character
   msg->codec[string_size] = '\0';
-
-  result |= buffer_read_uint32(&buffer, &(msg->size));
+  uint32_t payload_size_u32 = 0;
+  result |= buffer_read_uint32(&buffer, &payload_size_u32);
+  msg->size = (size_t)payload_size_u32;
   if (result) {
     // Can't allocate the proper size string if we didn't read the size, so
     // fail early
     return 1;
   }
-
-  msg->payload = &data[buffer.index];
+  if (buffer.index > size) {
+    return 1;
+  }
+  if (msg->size > (size_t)(size - buffer.index)) {
+    return 1;
+  }
+  // Payload points into the input buffer; it must be treated as read-only.
+  msg->payload = (void *)&data[buffer.index];
 
   return result;
 }
@@ -253,24 +266,31 @@ int wire_chunk_message_deserialize(wire_chunk_message_t *msg, const char *data,
   read_buffer_t buffer;
   int result = 0;
 
+  if (!msg || !data) {
+    return 1;
+  }
+
   buffer_read_init(&buffer, data, size);
 
   result |= buffer_read_int32(&buffer, &(msg->timestamp.sec));
   result |= buffer_read_int32(&buffer, &(msg->timestamp.usec));
-  result |= buffer_read_uint32(&buffer, &(msg->size));
+  uint32_t chunk_size_u32 = 0;
+  result |= buffer_read_uint32(&buffer, &chunk_size_u32);
+  msg->size = (size_t)chunk_size_u32;
 
   // If there's been an error already (especially for the size bit) return
   // early
   if (result) {
     return result;
   }
-
-  msg->payload = &data[buffer.index];
-
-  // Failed to allocate the memory
-  if (!msg->payload) {
-    return 2;
+  if (buffer.index > size) {
+    return 1;
   }
+  if (msg->size > (size_t)(size - buffer.index)) {
+    return 1;
+  }
+  // Payload points into the input buffer; it must be treated as read-only.
+  msg->payload = (void *)&data[buffer.index];
 
   // result |= buffer_read_buffer(&buffer, msg->payload, msg->size);
   return result;

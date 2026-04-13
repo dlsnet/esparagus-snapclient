@@ -15,19 +15,21 @@
 #include "nvs_flash.h"
 
 #if ENABLE_WIFI_PROVISIONING
+static void reset_reason_timer_counter_cb(void *);
 #include <string.h>  // for memcpy
 #include "wifi_provisioning.h"
 #endif
 
 static const char *TAG = "WIFI";
 
-static void reset_reason_timer_counter_cb(void *);
 
 static char mac_address[18];
 
 EventGroupHandle_t s_wifi_event_group;
 
 static int s_retry_num = 0;
+static bool s_wifi_initialized = false;
+static uint32_t s_wifi_disconnect_count = 0;
 
 static esp_netif_t *esp_wifi_netif = NULL;
 
@@ -79,9 +81,12 @@ static void event_handler(void *arg, esp_event_base_t event_base, int event_id,
 
     s_retry_num = 0;
     // Signal main application to continue execution
+    xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    s_wifi_disconnect_count++;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     if ((s_retry_num < WIFI_MAXIMUM_RETRY) || (WIFI_MAXIMUM_RETRY == 0)) {
       esp_wifi_connect();
       s_retry_num++;
@@ -93,12 +98,87 @@ static void event_handler(void *arg, esp_event_base_t event_base, int event_id,
   }
 }
 
+bool wifi_is_connected(void) {
+  if (s_wifi_event_group == NULL) {
+    return false;
+  }
+
+  return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+}
+
+uint32_t wifi_get_disconnect_count(void) { return s_wifi_disconnect_count; }
+
+esp_err_t wifi_wait_for_connection(TickType_t timeout_ticks) {
+  if (s_wifi_event_group == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (wifi_is_connected()) {
+    return ESP_OK;
+  }
+
+  EventBits_t bits =
+      xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                          pdFALSE, pdFALSE, timeout_ticks);
+
+  if (bits & WIFI_CONNECTED_BIT) {
+    return ESP_OK;
+  }
+
+  if (bits & WIFI_FAIL_BIT) {
+    return ESP_FAIL;
+  }
+
+  return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_reconnect(void) {
+  if (!s_wifi_initialized || s_wifi_event_group == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (wifi_is_connected()) {
+    return ESP_OK;
+  }
+
+  s_retry_num = 0;
+  xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+  esp_err_t err = esp_wifi_connect();
+  if (err == ESP_ERR_WIFI_CONN || err == ESP_ERR_WIFI_STATE) {
+    return ESP_OK;
+  }
+
+  return err;
+}
+
 void wifi_init(void) {
-  s_wifi_event_group = xEventGroupCreate();
+  wifi_config_t wifi_config = {0};
 
-  ESP_ERROR_CHECK(esp_netif_init());
+  if (s_wifi_event_group == NULL) {
+    s_wifi_event_group = xEventGroupCreate();
+  }
 
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  if (s_wifi_initialized) {
+    ESP_LOGI(TAG, "WiFi already initialized");
+
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
+    if (!wifi_is_connected()) {
+      ESP_ERROR_CHECK(wifi_reconnect());
+    }
+
+    goto wait_for_connection;
+  }
+
+  esp_err_t err = esp_netif_init();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(err);
+  }
+
+  err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(err);
+  }
 
   ESP_ERROR_CHECK(esp_event_handler_register(
       WIFI_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)&event_handler, NULL));
@@ -165,7 +245,6 @@ void wifi_init(void) {
   /* Start Wi-Fi station */
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-  wifi_config_t wifi_config;
   ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
   wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -176,7 +255,7 @@ void wifi_init(void) {
 
   improv_init();
 #else
-  wifi_config_t wifi_config = {
+  wifi_config = (wifi_config_t){
       .sta =
           {
               .ssid = WIFI_SSID,
@@ -195,12 +274,15 @@ void wifi_init(void) {
   ESP_LOGI(TAG, "wifi_init_sta finished.");
 #endif
 
+  s_wifi_initialized = true;
+
   /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or
    * connection failed for the maximum number of re-tries (WIFI_FAIL_BIT). The
    * bits are set by event_handler() (see above) */
-  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                         pdFALSE, pdFALSE, portMAX_DELAY);
+wait_for_connection:
+  EventBits_t bits =
+      xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                          pdFALSE, pdFALSE, portMAX_DELAY);
 
   /* xEventGroupWaitBits() returns the bits before the call returned, hence we
    * can test which event actually happened. */

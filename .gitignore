@@ -1,8 +1,12 @@
 build
+build-wifi
+build-ethernet
 libopus
 managed_components
 sdkconfig
 sdkconfig.old
+sdkconfig.local.wifi
+legacy/sdkconfig.old
 
 # Created by https://www.toptal.com/developers/gitignore/api/c,c++,eclipse
 # Edit at https://www.toptal.com/developers/gitignore?templates=c,c++,eclipse

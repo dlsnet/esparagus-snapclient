@@ -1,0 +1,7 @@
+#
+# Copy this file to sdkconfig.local.wifi and fill in your local Wi-Fi credentials.
+# The build pipeline applies it only for the wifi target, and the real file stays
+# outside git.
+#
+CONFIG_WIFI_SSID="YOUR_WIFI_SSID"
+CONFIG_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"

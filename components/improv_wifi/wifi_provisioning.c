@@ -32,7 +32,6 @@ static QueueHandle_t uart0_queue;
 void uart_event_handler(void) {
   uart_event_t event;
   uint8_t dtmp[RD_BUF_SIZE];
-  size_t buffered_size;
 
   // Waiting for UART event.
   if (xQueueReceive(uart0_queue, (void *)&event, (TickType_t)portMAX_DELAY)) {

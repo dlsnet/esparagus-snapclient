@@ -328,3 +328,27 @@ menu "Audio Board"
 	endmenu
 
 endmenu
+
+menu "Audio Power Control"
+
+config AUDIO_PWR_GPIO_DAC
+    int "DAC analog enable GPIO"
+    default 17
+    range 0 48
+    help
+        GPIO that enables the DAC analog section (e.g., PCM5102A XSMT).
+
+config AUDIO_PWR_GPIO_AMP
+    int "Amplifier enable GPIO"
+    default 16
+    range 0 48
+    help
+        GPIO that powers/enables the external amplifier.
+
+config AUDIO_PWR_ACTIVE_HIGH
+    bool "Enable pins are active-HIGH"
+    default y
+    help
+        If enabled, a HIGH level turns the DAC/AMP on. Disable for active-LOW designs.
+
+endmenu
