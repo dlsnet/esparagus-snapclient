@@ -1,0 +1,33 @@
+{
+    "name": "dlsHome Snapclient Ethernet",
+    "version": "2026-04-12",
+    "home_assistant_domain": "media_player",
+    "new_install_prompt_erase": true,
+    "builds": [
+        {
+            "chipFamily": "ESP32-S3",
+            "parts": [
+                {
+                    "path": "dlshome-ethernet-snapclient-latest-bootloader.bin",
+                    "offset": "0x0"
+                },
+                {
+                    "path": "dlshome-ethernet-snapclient-latest-partition-table.bin",
+                    "offset": "0x8000"
+                },
+                {
+                    "path": "dlshome-ethernet-snapclient-latest-ota_data_initial.bin",
+                    "offset": "0xd000"
+                },
+                {
+                    "path": "dlshome-ethernet-snapclient-latest-snapclient.bin",
+                    "offset": "0x10000"
+                },
+                {
+                    "path": "dlshome-ethernet-snapclient-latest-storage.bin",
+                    "offset": "0x370000"
+                }
+            ]
+        }
+    ]
+}

@@ -1,7 +1,12 @@
-# Esparagus Media Center firmware installer
+# dlsHome Snapclient Installer
 
-Web installer for the Esparagus Media Center project
+This installer builds the static web page published from [`docs/`](../docs) for this fork.
 
-the installer can be used here:
-https://sonocotta.github.io/esparagus-media-center/
+Supported install targets:
 
+- `dlsHome Wi-Fi`
+- `dlsHome Ethernet (W5500)`
+
+Unsupported upstream boards have been removed from the installer UI.
+
+The published firmware payloads live in [`docs/artifacts/`](../docs/artifacts), and the built web page is emitted into [`docs/`](../docs) by webpack.
