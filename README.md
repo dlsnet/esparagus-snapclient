@@ -34,6 +34,8 @@ ESP32 does not use Wi-Fi and Ethernet at the same time in this project. The sele
 - Updated the project to compile and run well on `ESP32-S3` hardware with `PSRAM`
 - Added a maintained build flow for both `wifi` and `ethernet`
 - Added a local-only Wi-Fi credentials overlay so SSID and password do not need to live in tracked config files
+- Added support for the `dlsHome` board's dedicated DAC/AMP power-switch GPIOs
+- Added support for the `dlsHome` board's dedicated dual status LEDs
 - Improved playback behavior and recovery for modern use on the maintained target
 - Improved handling of higher audio sample rates on the maintained hardware path
 - Kept legacy configuration files only as reference under [`legacy/`](legacy/)
@@ -173,6 +175,28 @@ If your hardware differs, update that overlay before building the `ethernet` pip
 This fork is maintained around the `PCM5102A` playback path on the `dlsHome` board.
 
 The maintained path has been updated for better behavior with higher sample-rate playback on the supported hardware. Legacy board combinations and legacy audio configurations have not been revalidated in this fork.
+
+## dlsHome Board Specifics
+
+This fork contains `dlsHome`-specific support for discrete audio power control and separate idle/playback LEDs.
+
+Audio power-switch GPIOs used by this fork:
+
+- `GPIO17`: DAC power / DAC analog enable
+- `GPIO16`: amplifier power / AMP enable
+
+Status LED GPIOs used by this fork:
+
+- `GPIO2`: idle/status LED on the `dlsHome` board
+- `GPIO5`: playback LED on the `dlsHome` board
+
+On the `dlsHome` board these LEDs are used as:
+
+- Solid red: device is powered on, has found the Snapserver, and is waiting for an audio feed
+- Solid green: device is actively playing an audio feed
+- Flashing red: device failed to find the Snapserver or has a connectivity issue
+
+The current implementation also uses a faster red flash as a critical-failure indication immediately before an automatic reboot after repeated recovery failures.
 
 ## Legacy Configurations
 

@@ -25,6 +25,32 @@
 
 static const char *TAG = "snapclient_eth_init";
 
+static void format_snapcast_dhcp_hostname(char *hostname, size_t hostname_len,
+                                          const uint8_t mac[6]) {
+  if (hostname == NULL || hostname_len == 0 || mac == NULL) {
+    return;
+  }
+
+  snprintf(hostname, hostname_len, "SnapCast-Player-%02X-%02X", mac[4],
+           mac[5]);
+}
+
+static void apply_eth_dhcp_hostname(esp_netif_t *eth_netif,
+                                    esp_eth_handle_t eth_handle) {
+  uint8_t mac[6] = {0};
+  char hostname[32];
+
+  if (eth_netif == NULL || eth_handle == NULL) {
+    return;
+  }
+
+  ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac));
+  format_snapcast_dhcp_hostname(hostname, sizeof(hostname), mac);
+
+  ESP_ERROR_CHECK(esp_netif_set_hostname(eth_netif, hostname));
+  ESP_LOGI(TAG, "Using Ethernet DHCP hostname: %s", hostname);
+}
+
 
 /* The event group allows multiple bits for each event, but we only care about
  * two events:
@@ -401,6 +427,10 @@ void eth_init(void) {
   esp_eth_handle_t *eth_handles;
   ESP_ERROR_CHECK(original_eth_init(&eth_handles, &eth_port_cnt));
 
+  if (s_eth_event_group == NULL) {
+    s_eth_event_group = xEventGroupCreate();
+  }
+
   // Initialize TCP/IP network interface aka the esp-netif (should be called
   // only once in application)
   ESP_ERROR_CHECK(esp_netif_init());
@@ -416,6 +446,7 @@ void eth_init(void) {
     // Attach Ethernet driver to TCP/IP stack
     ESP_ERROR_CHECK(
         esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handles[0])));
+    apply_eth_dhcp_hostname(eth_netif, eth_handles[0]);
   } else {
     // Use ESP_NETIF_INHERENT_DEFAULT_ETH when multiple Ethernet interfaces are
     // used and so you need to modify esp-netif configuration parameters for
@@ -439,6 +470,7 @@ void eth_init(void) {
       // Attach Ethernet driver to TCP/IP stack
       ESP_ERROR_CHECK(
           esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handles[i])));
+      apply_eth_dhcp_hostname(eth_netif, eth_handles[i]);
     }
   }
 
@@ -456,7 +488,6 @@ void eth_init(void) {
   /* Waiting until either the connection is established (ETH_CONNECTED_BIT) or
    * connection failed for the maximum number of re-tries (ETH_FAIL_BIT). The
    * bits are set by event_handler() (see above) */
-  s_eth_event_group = xEventGroupCreate();
   //    EventBits_t bits =
   xEventGroupWaitBits(s_eth_event_group, ETH_CONNECTED_BIT, pdFALSE, pdFALSE,
                       portMAX_DELAY);

@@ -6,6 +6,8 @@
 */
 #include "wifi_interface.h"
 
+#include <stdio.h>
+
 // #include "esp_event.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -32,6 +34,31 @@ static bool s_wifi_initialized = false;
 static uint32_t s_wifi_disconnect_count = 0;
 
 static esp_netif_t *esp_wifi_netif = NULL;
+
+static void format_snapcast_dhcp_hostname(char *hostname, size_t hostname_len,
+                                          const uint8_t mac[6]) {
+  if (hostname == NULL || hostname_len == 0 || mac == NULL) {
+    return;
+  }
+
+  snprintf(hostname, hostname_len, "SnapCast-Player-%02X-%02X", mac[4],
+           mac[5]);
+}
+
+static void apply_wifi_dhcp_hostname(void) {
+  uint8_t mac[6] = {0};
+  char hostname[32];
+
+  if (esp_wifi_netif == NULL) {
+    return;
+  }
+
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  format_snapcast_dhcp_hostname(hostname, sizeof(hostname), mac);
+
+  ESP_ERROR_CHECK(esp_netif_set_hostname(esp_wifi_netif, hostname));
+  ESP_LOGI(TAG, "Using WiFi DHCP hostname: %s", hostname);
+}
 
 #if ENABLE_WIFI_PROVISIONING
 static esp_timer_handle_t resetReasonTimerHandle = NULL;
@@ -164,6 +191,7 @@ void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
     if (!wifi_is_connected()) {
+      apply_wifi_dhcp_hostname();
       ESP_ERROR_CHECK(wifi_reconnect());
     }
 
@@ -187,6 +215,7 @@ void wifi_init(void) {
                                  (esp_event_handler_t)&event_handler, NULL));
 
   esp_wifi_netif = esp_netif_create_default_wifi_sta();
+  apply_wifi_dhcp_hostname();
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
